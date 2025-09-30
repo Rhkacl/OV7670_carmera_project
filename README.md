@@ -47,6 +47,8 @@ VGA 출력, 환경 센서 표시, LED 제어, LCD 표출 등을 통합해 SoC �
 
 ![cam2](docs/cam2.png)
 
+![LCD](docs/ILI9431_showpic.jpeg)
+
 ---
 
 ## 📊 Diagram & Flow Chart
