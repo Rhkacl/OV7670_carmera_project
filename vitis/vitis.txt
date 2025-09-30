@@ -1,0 +1,279 @@
+#include <stdio.h>
+#include <string.h>
+#include "platform.h"
+#include "xil_printf.h"
+#include "xparameters.h"
+#include "xiic.h"
+#include "sleep.h"
+#include <stdint.h>
+
+/* === 주소 정의 === */
+#define BTN_ADDR   XPAR_MYIP_BTN_0_BASEADDR
+#define DHT11_ADDR XPAR_MYIP_DHT11_0_BASEADDR
+#define PWM1_ADDR  XPAR_MYIP_PWM_RGB_0_BASEADDR
+#define CAM_ADDR   XPAR_MYIP_CAM_QQVGA2_0_BASEADDR // OV7670/SoC 모듈
+#define IIC1_ADDR  XPAR_AXI_IIC_0_BASEADDR       // 기존 XIic I2C 컨트롤러
+#define IIC2_ADDR  XPAR_MYIP_IIC_TXTLCD_0_BASEADDR // 새로 만든 txtlcd IP (MMIO)
+#define LCD_I2C_DEV_ADDR 0x27
+
+XIic iic_instance;
+
+/* === PWM 관련 === */
+#define PWM_PERIOD       255u
+#define PWM_DUTY_OFFSET  0x00
+#define PWM_PERIOD_OFFSET 0x04
+#define PWM_ENABLE_OFFSET 0x08
+#define PWM2_WORD_STRIDE_BYTES 4  // 32-bit 기준
+
+static inline void mmio_write32(uint32_t addr, uint32_t val) { Xil_Out32(addr, val); }
+static inline uint32_t mmio_read32(uint32_t addr) { return Xil_In32(addr); }
+
+void pwm2_set_channel(uint32_t base, int ch, uint32_t duty) {
+    uint32_t ch_base = base + (uint32_t)ch * PWM2_WORD_STRIDE_BYTES;
+    mmio_write32(ch_base + PWM_PERIOD_OFFSET, PWM_PERIOD);
+    mmio_write32(ch_base + PWM_DUTY_OFFSET, duty);
+    mmio_write32(ch_base + PWM_ENABLE_OFFSET, 1);
+}
+
+/* === XIic 기반 I2C LCD 함수들 (기존 방식 유지) === */
+void lcdCommand_i2c(uint8_t command) {
+    uint8_t high_nibble = command & 0xf0;
+    uint8_t low_nibble  = (command <<4) & 0xf0;
+    uint8_t data_array[4] = {
+        high_nibble | 0x04 | 0x08,
+        high_nibble | 0x00 | 0x08,
+        low_nibble  | 0x04 | 0x08,
+        low_nibble  | 0x00 | 0x08
+    };
+    XIic_Send(iic_instance.BaseAddress, LCD_I2C_DEV_ADDR, data_array, 4, XIIC_STOP);
+    usleep(50);
+}
+
+void lcdData_i2c(uint8_t data) {
+    uint8_t high_nibble = data & 0xf0;
+    uint8_t low_nibble  = (data <<4) & 0xf0;
+    uint8_t data_array[4] = {
+        high_nibble |0x05 |0x08,
+        high_nibble |0x01 |0x08,
+        low_nibble  |0x05 |0x08,
+        low_nibble  |0x01 |0x08
+    };
+    XIic_Send(iic_instance.BaseAddress, LCD_I2C_DEV_ADDR, data_array, 4, XIIC_STOP);
+    usleep(50);
+}
+
+void i2cLcd_Init_i2c() {
+    msleep(50);
+    lcdCommand_i2c(0x33); msleep(5);
+    lcdCommand_i2c(0x32); msleep(5);
+    lcdCommand_i2c(0x28); msleep(5);
+    lcdCommand_i2c(0x0c); msleep(5);
+    lcdCommand_i2c(0x06); msleep(5);
+    lcdCommand_i2c(0x01); msleep(2);
+}
+
+void lcdString_i2c(char *str) { while(*str) lcdData_i2c(*str++); }
+void moveCursor_i2c(uint8_t row, uint8_t col) { lcdCommand_i2c(0x80 | row <<6 | col); }
+void Display_clear_i2c() { lcdCommand_i2c(0x01); usleep(2000); }
+
+/* === TXT-LCD IP (사용자 제공 코드) : MMIO 인스턴스용 함수 (이름 변경하여 통합) ===
+   원본 함수 시그니처를 약간 손대서 _txt 접미사로 통합했습니다.
+*/
+void lcdCommand_txt(uint8_t command, volatile unsigned int *txtlcd_instance){
+    while(txtlcd_instance[3]);            // busy flag
+    txtlcd_instance[0] = 0x27;           // I2C addr
+    txtlcd_instance[1] = command;        // data
+    txtlcd_instance[2] = 0x1;            // cmd
+    while(txtlcd_instance[3]);
+    txtlcd_instance[2] = 0;
+}
+
+void lcdData_txt(uint8_t data, volatile unsigned int *txtlcd_instance){
+    while(txtlcd_instance[3]);
+    txtlcd_instance[0] = 0x27;
+    txtlcd_instance[1] = data;
+    txtlcd_instance[2] = 0x3;  // data + RS
+    while(txtlcd_instance[3]);
+    txtlcd_instance[2] = 0;
+}
+
+void i2cLcd_Init_txt(volatile unsigned int *txtlcd_instance)
+{
+  msleep(50);
+  lcdCommand_txt(0x33, txtlcd_instance);
+  msleep(5);
+  lcdCommand_txt(0x32, txtlcd_instance);
+  msleep(5);
+  lcdCommand_txt(0x28, txtlcd_instance);
+  msleep(5);
+  lcdCommand_txt(0x0c, txtlcd_instance);
+  msleep(5);
+  lcdCommand_txt(0x06, txtlcd_instance);
+  msleep(5);
+  lcdCommand_txt(0x01, txtlcd_instance);    //약 2ms 필요
+  msleep(2);
+}
+
+void lcdString_txt(char *str, volatile unsigned int *txtlcd_instance)
+{
+    while(*str) lcdData_txt(*str++, txtlcd_instance);
+}
+
+void moveCursor_txt(uint8_t row, uint8_t col, volatile unsigned int *txtlcd_instance)
+{
+  lcdCommand_txt(0x80 | row <<6 | col, txtlcd_instance);
+}
+
+void Display_clear_txt(volatile unsigned int *txtlcd_instance)
+{
+  lcdCommand_txt(0x01, txtlcd_instance);
+  usleep(2000);
+}
+
+/* === 버튼 디바운스 함수 (간단 샘플링) === */
+static uint32_t read_buttons_debounced(volatile unsigned int *btn_instance) {
+    uint32_t stable = btn_instance[0] & 0x03;
+    int stable_cnt = 1;
+    for (int attempts = 0; attempts < 6 && stable_cnt < 3; ++attempts) {
+        msleep(8);
+        uint32_t v = btn_instance[0] & 0x03;
+        if (v == stable) stable_cnt++;
+        else { stable = v; stable_cnt = 1; }
+    }
+    return stable;
+}
+
+/* === 모드 정의(예시 값: IP 스펙에 맞게 조정) === */
+#define MODE_NORMAL  0
+#define MODE_RED     1
+#define MODE_YELLOW  2
+
+/* === 메인 === */
+int main() {
+    init_platform();
+
+    /* MMIO 인스턴스 포인터들 */
+    volatile unsigned int *pwm_instance = (volatile unsigned int*)PWM1_ADDR;
+    volatile unsigned int *dht_instance = (volatile unsigned int*)DHT11_ADDR;
+    volatile unsigned int *btn_instance = (volatile unsigned int*)BTN_ADDR;
+    volatile unsigned int *cam_instance = (volatile unsigned int*)CAM_ADDR;
+    volatile unsigned int *txtlcd_instance = (volatile unsigned int*) IIC2_ADDR; // 새로 만든 IP의 base
+
+    /* XIic 초기화 (기존 I2C LCD) */
+    XIic_Initialize(&iic_instance, IIC1_ADDR);
+    XIic_Start(&iic_instance);
+    i2cLcd_Init_i2c();
+
+    /* TXT-LCD IP 초기화 (MMIO 방식) */
+    i2cLcd_Init_txt(txtlcd_instance);
+
+    /* 초기화: 첫 LCD(기존 I2C)는 Hum/Temp 자리 확보 */
+    Display_clear_i2c();
+    lcdString_i2c("Humidity: 00   ");
+    moveCursor_i2c(1,0);
+    lcdString_i2c("Temperature: 00 ");
+
+    /* TXT-LCD 초기 모드 표시 */
+    Display_clear_txt(txtlcd_instance);
+    moveCursor_txt(0, 0, txtlcd_instance);
+    lcdString_txt("MODE: NORMAL   ", txtlcd_instance); // 16자 맞춰서 출력
+
+    /* 초기 CAM NORMAL로 강제 */
+    mmio_write32(CAM_ADDR, MODE_NORMAL);
+
+    /* 초기 버튼 안정값 */
+    uint32_t btn_prev = read_buttons_debounced(btn_instance);
+
+    /* 기타 변수 */
+    int humi = 0, tmpr = 0;
+    unsigned int pwm = 0;
+    char updown_flag = 1;
+    int current_mode = MODE_NORMAL;
+    const char *mode_name[] = {"NORMAL","RED   ","YELLOW"};
+
+    /* PWM 초기 끔 */
+    pwm2_set_channel(PWM1_ADDR, 0, 0);
+    pwm2_set_channel(PWM1_ADDR, 1, 0);
+    pwm2_set_channel(PWM1_ADDR, 2, 0);
+
+    /* 메인 루프 */
+    while (1) {
+        /* --- DHT 읽기 --- */
+        humi = (int)dht_instance[0];
+        tmpr = (int)dht_instance[1];
+
+        /* --- 기존 I2C LCD: 숫자 위치만 업데이트 (col14~15) --- */
+        moveCursor_i2c(0, 14);
+        lcdData_i2c((humi / 10) % 10 + '0');
+        lcdData_i2c(humi % 10 + '0');
+        moveCursor_i2c(1, 14);
+        lcdData_i2c((tmpr / 10) % 10 + '0');
+        lcdData_i2c(tmpr % 10 + '0');
+
+        /* --- Front PWM 기존 로직 --- */
+        if (pwm >= 255) updown_flag = 0;
+        else if (pwm <= 10) updown_flag = 1;
+        if (updown_flag) pwm++;
+        else pwm--;
+        msleep(30);
+        pwm_instance[0] = pwm;
+
+        /* --- 버튼 읽기(디바운스) 및 엣지 토글 --- */
+        uint32_t btn_stable = read_buttons_debounced(btn_instance);
+        uint32_t changed = btn_stable ^ btn_prev;
+
+        /* 버튼1: rising-edge => RED <-> NORMAL */
+        if (changed & 0x01) {
+            if ((btn_prev & 0x01) == 0 && (btn_stable & 0x01) == 1) {
+                if (current_mode == MODE_RED) {
+                    current_mode = MODE_NORMAL;
+                    mmio_write32(CAM_ADDR, MODE_NORMAL);
+                } else {
+                    current_mode = MODE_RED;
+                    mmio_write32(CAM_ADDR, MODE_RED);
+                }
+                /* TXT-LCD에 모드 전체 라인(16자)로 갱신 */
+                char line[17];
+                snprintf(line, sizeof(line), "MODE:%-10s", mode_name[current_mode]);
+                moveCursor_txt(0, 0, txtlcd_instance);
+                lcdString_txt(line, txtlcd_instance);
+            }
+        }
+
+        /* 버튼2: rising-edge => YELLOW <-> NORMAL */
+        if (changed & 0x02) {
+            if ((btn_prev & 0x02) == 0 && (btn_stable & 0x02) == 2) {
+                if (current_mode == MODE_YELLOW) {
+                    current_mode = MODE_NORMAL;
+                    mmio_write32(CAM_ADDR, MODE_NORMAL);
+                } else {
+                    current_mode = MODE_YELLOW;
+                    mmio_write32(CAM_ADDR, MODE_YELLOW);
+                }
+                /* TXT-LCD 갱신 */
+                char line[17];
+                snprintf(line, sizeof(line), "MODE:%-10s", mode_name[current_mode]);
+                moveCursor_txt(0, 0, txtlcd_instance);
+                lcdString_txt(line, txtlcd_instance);
+            }
+        }
+
+        btn_prev = btn_stable;
+
+        /* --- 온도에 따른 LED 원래 로직 유지 --- */
+        if (tmpr >= 30) {
+            pwm2_set_channel(PWM1_ADDR, 0, PWM_PERIOD);
+            pwm2_set_channel(PWM1_ADDR, 1, 0);
+            pwm2_set_channel(PWM1_ADDR, 2, 0);
+        } else {
+            pwm2_set_channel(PWM1_ADDR, 0, 0);
+            pwm2_set_channel(PWM1_ADDR, 1, PWM_PERIOD);
+            pwm2_set_channel(PWM1_ADDR, 2, 0);
+        }
+
+        msleep(80);
+    }
+
+    cleanup_platform();
+    return 0;
+}
